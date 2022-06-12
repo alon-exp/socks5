@@ -1,4 +1,5 @@
 #include "lib.h"
+#include "log.h"
 
 extern int server_fd;
 int epoll_fd;
@@ -20,7 +21,7 @@ void opt_event(int epoll_fd, int opt, struct event_data *event_data, uint32_t st
     ev.data.ptr = event_data;
     if (epoll_ctl(epoll_fd, opt, event_data->fd, &ev) == -1)
     {
-        fprintf(stderr, "opt_event: %s addr: %s\n", strerror(errno), inet_ntoa(event_data->addr.sin_addr));
+        LOG_DEBUG("opt_event: %s addr: %s\n", strerror(errno), inet_ntoa(event_data->addr.sin_addr));
         // clear_event(event_data);
     }
 }
@@ -32,7 +33,7 @@ void clear_event(struct event_data *event)
         return;
     }
 
-    printf("client close fd %d\n", event->fd);
+    LOG_DEBUG("client close fd %d\n", event->fd);
     opt_event(epoll_fd, EPOLL_CTL_DEL, event, EPOLLIN);
     event->to = NULL;
     close(event->fd);

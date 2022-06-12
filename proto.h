@@ -56,7 +56,7 @@
 #define UDP_RESERVED 0x0000
 
 // frag
-#define UDP_FRAG 0x00 
+#define UDP_FRAG 0x00
 
 // atyp
 #define IPV4 0x01
