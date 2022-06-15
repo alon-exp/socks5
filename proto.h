@@ -41,7 +41,7 @@
 #define METHOD_REPLY_LEN 0x002
 #define MAX_METHOD_REPLY_LEN METHOD_REPLY_LEN
 #define MIN_METHOD_REPLY_LEN METHOD_REPLY_LEN
-#define MAX_SOCKS_REQUEST_LEN 0x103
+#define MAX_SOCKS_REQUEST_LEN 0x105 // 5 + 253 + 1(include dot) + 2
 #define MIN_SOCKS_REUQEST_LEN 0x00A
 #define MAX_AUTH_REQUEST_LEN 513
 #define MIN_AUTH_REQUEST_LEN 5
@@ -156,6 +156,6 @@ struct auth_reply
 char *add_socks_udp_header(struct socks_udp_header *socks_udp_header, uint8_t *payload, in_addr_t remote_udp_addr, in_port_t remote_udp_port, int *add_len);
 char *del_socks_udp_header(struct socks_udp_header *socks_udp_header, uint8_t *payload, int *del_len);
 bool check_validity(uint8_t *rx, int recvlen, int stage);
-bool check_method(uint8_t *rx, uint8_t method);
+bool check_method(uint8_t *rx, int recvlen, uint8_t method);
 
 #endif
