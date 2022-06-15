@@ -14,11 +14,13 @@
 #define LOG_DEBUG(format, ...)
 #endif
 
-#define LOG_INFO(format, ...)                                                             \
-    do                                                                                    \
-    {                                                                                     \
-        printf("INFO:  File:%s, Line:%d, " format "", __FILE__, __LINE__, ##__VA_ARGS__); \
-                                                                                          \
+#define LOG_INFO(format, ...)                      \
+    do                                             \
+    {                                              \
+        printf("INFO: " format "", ##__VA_ARGS__); \
+                                                   \
     } while (0)
+
+void log_info();
 
 #endif

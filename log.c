@@ -2,5 +2,5 @@
 
 inline void log_info()
 {
-    printf("INFO:\n");
+    LOG_INFO("socks server %s running\n", "1.1.0");
 }
