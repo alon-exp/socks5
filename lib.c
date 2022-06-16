@@ -1,40 +1,35 @@
 #include "lib.h"
+#include "log.h"
 
 extern int server_fd;
+extern ares_channel channel;
 int epoll_fd;
-
-static bool isFileDescriptor(int fd)
-{
-    return !(-1 == fcntl(fd, F_GETFD, NULL) && errno == EBADF);
-}
 
 void opt_event(int epoll_fd, int opt, struct event_data *event_data, uint32_t state)
 {
-    if (!isFileDescriptor(event_data->fd))
-    {
-        return;
-    }
-
     struct epoll_event ev;
     ev.events = state;
     ev.data.ptr = event_data;
     if (epoll_ctl(epoll_fd, opt, event_data->fd, &ev) == -1)
     {
-        fprintf(stderr, "opt_event: %s addr: %s\n", strerror(errno), inet_ntoa(event_data->addr.sin_addr));
-        // clear_event(event_data);
+        LOG_DEBUG("opt_event: %s\n", strerror(errno));
     }
 }
 
 void clear_event(struct event_data *event)
 {
-    if (!isFileDescriptor(event->fd))
+    opt_event(epoll_fd, EPOLL_CTL_DEL, event, EPOLLIN);
+    if (errno == EBADF || errno == ENOENT)
     {
         return;
     }
 
-    printf("client close fd %d\n", event->fd);
-    opt_event(epoll_fd, EPOLL_CTL_DEL, event, EPOLLIN);
-    event->to = NULL;
+    if (event->to)
+    {
+        event->to->to = NULL;
+        clear_event(event->to);
+    }
+    LOG_DEBUG("client close fd %d\n", event->fd);
     close(event->fd);
     free(event);
 }
@@ -54,17 +49,20 @@ void epoll_start(int epoll_fd, int epoll_max_events, int timeout)
 
             if ((events[i].events & EPOLLHUP || events[i].events & EPOLLERR) && event_data->fd != server_fd)
             {
-                // handle rst bit
-                if (event_data->to != NULL)
-                {
-                    clear_event(event_data->to);
-                }
+                // handle close / rst bit
+                LOG_DEBUG("event_data epollhup close fd %d\n", event_data->fd);
                 clear_event(event_data);
             }
-            else if (events[i].events & EPOLLIN)
+            else if (events[i].events & EPOLLIN && event_data->type != EVENT_DATA_TYPE_DNS)
             {
                 // callback function
                 event_data->cb(event_data);
+            }
+            else if (event_data->type == EVENT_DATA_TYPE_DNS)
+            {
+                ares_process_fd(channel,
+                                ((events[i].events) & (EPOLLIN) ? event_data->fd : ARES_SOCKET_BAD),
+                                ((events[i].events) & (EPOLLOUT) ? event_data->fd : ARES_SOCKET_BAD));
             }
         }
     }
