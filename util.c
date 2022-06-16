@@ -31,5 +31,3 @@ in_addr_t resolve_domain(char *domain, int *atyp)
     *atyp = host->h_addrtype;
     return *(in_addr_t *)host->h_addr;
 }
-
-
