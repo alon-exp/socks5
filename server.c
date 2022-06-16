@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include "log.h"
 #include "util.h"
 #include "lib.h"
 #include "proto.h"
@@ -25,8 +26,11 @@
 
 extern int epoll_fd;
 int server_fd;
+ares_channel channel;
+ares_socket_t dns_query_sock = -1;
+struct dns_cache *dns_cache_head = NULL;
 
-void method_reply_cb(struct event_data *client_event)
+static void method_reply_cb(struct event_data *client_event)
 {
     int recvlen, sendlen;
     uint8_t rx[MAX_METHOD_REQUEST_LEN] = {0}, tx[MAX_METHOD_REPLY_LEN] = {0};
@@ -36,7 +40,7 @@ void method_reply_cb(struct event_data *client_event)
     recvlen = recv(client_event->fd, rx, MAX_METHOD_REQUEST_LEN, 0);
     if (recvlen == -1)
     {
-        fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+        LOG_DEBUG("method_reply_cb recv error: %s\n", strerror(errno));
         if (errno == EAGAIN)
         {
             return;
@@ -47,28 +51,29 @@ void method_reply_cb(struct event_data *client_event)
     if (check_validity(rx, recvlen, SOCKS5_METHOD_REQUEST))
     {
         method_replay->ver = VERSION;
-        if (check_method(rx, USERNAME_PASSWORD))
+        if (check_method(rx, recvlen, USERNAME_PASSWORD))
         {
             method_replay->method = USERNAME_PASSWORD;
             sendlen = send(client_event->fd, tx, MAX_METHOD_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
-                clear_event(client_event);
+                LOG_DEBUG("%s\n", strerror(errno));
+                // LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
+                // clear_event(client_event);
                 return;
             }
             // move to the next step
             client_event->cb = auth_cb;
         }
-        else if (check_method(rx, NO_AUTHENTICATION_REQUIRED))
+        else if (check_method(rx, recvlen, NO_AUTHENTICATION_REQUIRED))
         {
             method_replay->method = NO_AUTHENTICATION_REQUIRED;
             sendlen = send(client_event->fd, tx, MAX_METHOD_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
-                // close(client_event->fd);
-                clear_event(client_event);
+                LOG_DEBUG("%s\n", strerror(errno));
+                // LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
+                // clear_event(client_event);
                 return;
             }
             // move to the next step
@@ -80,50 +85,94 @@ void method_reply_cb(struct event_data *client_event)
             sendlen = send(client_event->fd, tx, MAX_METHOD_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+                LOG_DEBUG("%s\n", strerror(errno));
             }
+            LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
             clear_event(client_event);
         }
     }
     else
     {
+        LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
         clear_event(client_event);
     }
 }
 
-void conn_relay(struct event_data *client_event, struct socks_request *socks_request)
+void resolve_domain_cb(void *arg, int status, int timeouts, struct hostent *host)
+{
+    struct
+    {
+        struct event_data *client_event;
+        struct socks_request *socks_request;
+        struct event_data *dns_query;
+    } *conn_relay_argv = arg;
+
+    char *domain = (char *)calloc(1, conn_relay_argv->socks_request->dst.domain.len + 1);
+    memcpy(domain, conn_relay_argv->socks_request->dst.domain.str, conn_relay_argv->socks_request->dst.domain.len);
+
+    LOG_DEBUG("domain len: %d domain name: %s\n", conn_relay_argv->socks_request->dst.domain.len, domain);
+
+    struct dns_cache *dns_cache_ret = NULL;
+    HASH_FIND_STR(dns_cache_head, domain, dns_cache_ret);
+
+    LOG_DEBUG("resolve_domain_cb status: %s\n", ares_strerror(status));
+    LOG_DEBUG("remote: %s fd: %d\n", domain, conn_relay_argv->client_event->fd);
+    free(domain);
+
+    if (status == ARES_SUCCESS)
+    {
+        if (dns_cache_ret)
+        {
+            dns_cache_ret->ipv4 = *(in_addr_t *)host->h_addr;
+        }
+        conn_relay(conn_relay_argv->client_event, conn_relay_argv->socks_request, *(in_addr_t *)host->h_addr);
+    }
+
+    // LOG_DEBUG("clear dns query event fd: %d\n", conn_relay_argv->dns_query->fd);
+    // clear_event(conn_relay_argv->dns_query);
+    free(arg);
+}
+
+static void conn_relay(struct event_data *client_event, struct socks_request *socks_request, in_addr_t conn_addr)
 {
     int sendlen;
     uint8_t tx[MAX_SOCKS_REPLY_LEN] = {0};
     struct socks_reply *socks_reply = (struct socks_reply *)tx;
 
-    //ipv4 or domain
+    // ipv4 or domain
     if (socks_request->atyp == IPV4 || socks_request->atyp == DOMAIN)
     {
         int remote_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        struct event_data *remote_event = (struct event_data *)malloc(sizeof(struct event_data));
+        struct event_data *remote_event = (struct event_data *)calloc(1, sizeof(struct event_data));
         struct sockaddr_in remote_addr;
         memset(&remote_addr, '\0', sizeof(remote_addr));
 
-        in_addr_t dst_addr;
-        in_port_t dst_port;
+        in_addr_t dst_addr = 0;
+        in_port_t dst_port = 0;
         if (socks_request->atyp == DOMAIN)
         {
             int atyp;
-            char *domain = (char *)malloc(socks_request->dst.domain.len + 1);
-            // memset(domain, '\0', socks_request->dst.domain.len + 1);
-            domain[socks_request->dst.domain.len] = '\0';
+            char *domain = (char *)calloc(1, socks_request->dst.domain.len + 1);
             memcpy(domain, socks_request->dst.domain.str, socks_request->dst.domain.len);
-            dst_addr = resolve_domain(domain, &atyp);
-            if (dst_addr == 0U)
+
+            if (conn_addr)
             {
-                printf("resolve error: %s\n", domain);
+                dst_addr = conn_addr;
             }
             else
             {
-                printf("resolve success: %s\n", domain);
+                dst_addr = resolve_domain(domain, &atyp);
             }
-            memcpy(&dst_port, socks_request->dst.domain.str + socks_request->dst.domain.len, 2);
+
+            if (dst_addr == 0U)
+            {
+                LOG_DEBUG("resolve error: %s\n", domain);
+            }
+            else
+            {
+                LOG_DEBUG("resolve success: %s\n", domain);
+            }
+            dst_port = *(uint16_t *)(socks_request->dst.domain.str + socks_request->dst.domain.len);
             free(domain);
         }
         else
@@ -136,7 +185,7 @@ void conn_relay(struct event_data *client_event, struct socks_request *socks_req
         remote_addr.sin_port = dst_port;
         remote_addr.sin_addr.s_addr = dst_addr;
 
-        printf("remote_ip: %s\n", inet_ntoa(remote_addr.sin_addr));
+        LOG_DEBUG("remote_ip: %s remote_port: %d\n", inet_ntoa(remote_addr.sin_addr), ntohs(dst_port));
 
         in_addr_t local_addr;
         in_port_t local_port;
@@ -150,7 +199,7 @@ void conn_relay(struct event_data *client_event, struct socks_request *socks_req
 
         if (connect(remote_fd, (struct sockaddr *)&remote_addr, sizeof(remote_addr)) == -1)
         {
-            fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+            LOG_DEBUG("connect: %s\n", strerror(errno));
 
             switch (errno)
             {
@@ -179,9 +228,10 @@ void conn_relay(struct event_data *client_event, struct socks_request *socks_req
             sendlen = send(client_event->fd, tx, MIN_SOCKS_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+                LOG_DEBUG("%s\n", strerror(errno));
             }
 
+            LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
             clear_event(client_event);
             close(remote_fd);
             free(remote_event);
@@ -194,14 +244,15 @@ void conn_relay(struct event_data *client_event, struct socks_request *socks_req
             sendlen = send(client_event->fd, tx, MIN_SOCKS_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
-                clear_event(client_event);
+                LOG_DEBUG("%s\n", strerror(errno));
+                // LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
+                // clear_event(client_event);
                 close(remote_fd);
                 free(remote_event);
                 return;
             }
 
-            //remote_event
+            // remote_event
             remote_event->addr = remote_addr;
             remote_event->fd = remote_fd;
             remote_event->cb = tcp_relay_cb;
@@ -217,14 +268,15 @@ void conn_relay(struct event_data *client_event, struct socks_request *socks_req
     {
         not_support(client_event, socks_request, ADDRESS_TYPE_NOT_SUPPORTED);
     }
+    free(socks_request);
 }
 
-void bind_relay(struct event_data *client_event, struct socks_request *socks_request)
+static void bind_relay(struct event_data *client_event, struct socks_request *socks_request)
 {
     not_support(client_event, socks_request, COMMAND_NOT_SUPPORTED);
 }
 
-void udp_relay(struct event_data *client_event, struct socks_request *socks_request)
+static void udp_relay(struct event_data *client_event, struct socks_request *socks_request)
 {
     int sendlen;
     uint8_t tx[MAX_SOCKS_REPLY_LEN] = {0};
@@ -248,11 +300,11 @@ void udp_relay(struct event_data *client_event, struct socks_request *socks_requ
             src_addr = resolve_domain(domain, &atyp);
             if (src_addr == 0U)
             {
-                printf("resolve error: %s\n", domain);
+                LOG_DEBUG("resolve error: %s\n", domain);
             }
             else
             {
-                printf("resolve success: %s\n", domain);
+                LOG_DEBUG("resolve success: %s\n", domain);
             }
             memcpy(&src_port, socks_request->dst.domain.str + socks_request->dst.domain.len, 2);
             free(domain);
@@ -285,13 +337,14 @@ void udp_relay(struct event_data *client_event, struct socks_request *socks_requ
 
         if (ret == -1)
         {
-            fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+            LOG_DEBUG("%s\n", strerror(errno));
             socks_reply->rep = GENERAL_SOCKS_SERVER_FAILURE;
             sendlen = send(client_event->fd, tx, MIN_SOCKS_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+                LOG_DEBUG("%s\n", strerror(errno));
             }
+            LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
             clear_event(client_event);
             close(udp_fd);
             free(client_udp_event);
@@ -301,7 +354,8 @@ void udp_relay(struct event_data *client_event, struct socks_request *socks_requ
             sendlen = send(client_event->fd, tx, MIN_SOCKS_REPLY_LEN, 0);
             if (sendlen == -1)
             {
-                fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+                LOG_DEBUG("%s\n", strerror(errno));
+                LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
                 clear_event(client_event);
                 close(udp_fd);
                 free(client_udp_event);
@@ -321,7 +375,7 @@ void udp_relay(struct event_data *client_event, struct socks_request *socks_requ
     }
 }
 
-void not_support(struct event_data *client_event, struct socks_request *socks_request, uint8_t rep)
+static void not_support(struct event_data *client_event, struct socks_request *socks_request, uint8_t rep)
 {
     int sendlen;
     uint8_t tx[MAX_SOCKS_REPLY_LEN] = {0};
@@ -336,21 +390,23 @@ void not_support(struct event_data *client_event, struct socks_request *socks_re
     sendlen = send(client_event->fd, tx, MIN_SOCKS_REPLY_LEN, 0);
     if (sendlen == -1)
     {
-        fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+        LOG_DEBUG("%s\n", strerror(errno));
     }
+    LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
     clear_event(client_event);
 }
 
-void socks_reply_cb(struct event_data *client_event)
+static void socks_reply_cb(struct event_data *client_event)
 {
     int recvlen, sendlen;
-    uint8_t rx[MAX_SOCKS_REQUEST_LEN] = {0};
+    // uint8_t rx[MAX_SOCKS_REQUEST_LEN] = {0};
+    uint8_t *rx = (uint8_t *)malloc(MAX_SOCKS_REQUEST_LEN);
     struct socks_request *socks_request = (struct socks_request *)rx;
 
     recvlen = recv(client_event->fd, rx, MAX_SOCKS_REQUEST_LEN, 0);
     if (recvlen == -1)
     {
-        perror("tcp_relay_cb_recv");
+        LOG_DEBUG("socks_relay_cb recv error: %s\n", strerror(errno));
         if (errno == EAGAIN)
         {
             return;
@@ -360,6 +416,7 @@ void socks_reply_cb(struct event_data *client_event)
     // check the validity of the packet
     if (!check_validity(rx, recvlen, SOCKS5_SOCKS_REQUEST))
     {
+        LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
         clear_event(client_event);
         return;
     }
@@ -367,7 +424,75 @@ void socks_reply_cb(struct event_data *client_event)
     switch (socks_request->cmd)
     {
     case CONNECT:
-        conn_relay(client_event, socks_request);
+        if (socks_request->atyp == DOMAIN && true)
+        {
+
+            struct event_data *dns_query_event = (struct event_data *)calloc(1, sizeof(struct event_data));
+
+            typedef struct
+            {
+                struct event_data *ce;
+                struct socks_request *sr;
+                struct event_data *dq;
+            } conn_relay_argv;
+
+            conn_relay_argv *conn_relay_arg = (conn_relay_argv *)malloc(sizeof(conn_relay_argv));
+
+            conn_relay_arg->ce = client_event;
+            conn_relay_arg->sr = socks_request;
+            conn_relay_arg->dq = dns_query_event;
+
+            char *domain = (char *)calloc(1, socks_request->dst.domain.len + 1);
+            memcpy(domain, socks_request->dst.domain.str, socks_request->dst.domain.len);
+
+            LOG_DEBUG("remote: %s fd: %d\n", domain, client_event->fd);
+            struct dns_cache *dns_cache = (struct dns_cache *)calloc(1, sizeof(struct dns_cache));
+
+            dns_cache->domain_name = domain;
+
+            struct dns_cache *dns_cache_ret = NULL;
+            HASH_FIND_STR(dns_cache_head, domain, dns_cache_ret);
+
+            if (dns_cache_ret)
+            {
+                free(domain);
+                if (dns_cache_ret->ipv4 != 0)
+                {
+                    LOG_DEBUG("use dns cache\n");
+                    conn_relay(client_event, socks_request, dns_cache_ret->ipv4);
+                }
+                return;
+            }
+            else
+            {
+                HASH_ADD_KEYPTR(hh, dns_cache_head, domain, socks_request->dst.domain.len, dns_cache);
+                ares_gethostbyname(channel, domain, AF_INET, resolve_domain_cb, conn_relay_arg);
+                LOG_DEBUG("domain len: %d resolve domain name: %s\n", socks_request->dst.domain.len, domain);
+            }
+
+            // free(domain);
+            // ares_socket_t sock;
+            int bitmask = ares_getsock(channel, &dns_query_sock, 1);
+            LOG_DEBUG("ares_getsock: %d\n", dns_query_sock);
+
+            uint32_t events = 0;
+            if (ARES_GETSOCK_READABLE(bitmask, 0))
+            {
+                events |= EPOLLIN;
+            }
+            if (ARES_GETSOCK_WRITABLE(bitmask, 0))
+            {
+                events |= EPOLLOUT;
+            }
+
+            dns_query_event->fd = dns_query_sock;
+            dns_query_event->type = EVENT_DATA_TYPE_DNS;
+            opt_event(epoll_fd, EPOLL_CTL_ADD, dns_query_event, events);
+        }
+        else
+        {
+            conn_relay(client_event, socks_request, 0U);
+        }
         break;
     case BIND:
         // bind_relay(client_event, socks_request);
@@ -383,7 +508,7 @@ void socks_reply_cb(struct event_data *client_event)
     }
 }
 
-void tcp_relay_cb(struct event_data *event)
+static void tcp_relay_cb(struct event_data *event)
 {
     int recvlen, sendlen;
     uint8_t buf[BUF_SIZE] = {0};
@@ -394,17 +519,17 @@ void tcp_relay_cb(struct event_data *event)
         sendlen = send(event->to->fd, buf, recvlen, 0);
         if (sendlen == -1)
         {
-            fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+            LOG_DEBUG("%s\n", strerror(errno));
         }
     }
-    if (recvlen == 0)
+    else if (recvlen == 0)
     {
         shutdown(event->fd, SHUT_RD);
         shutdown(event->to->fd, SHUT_WR);
     }
 }
 
-void udp_relay_cb(struct event_data *event)
+static void udp_relay_cb(struct event_data *event)
 {
     int recvlen, sendlen;
     uint8_t rx[BUF_SIZE] = {0}, tx[BUF_SIZE] = {0};
@@ -420,7 +545,7 @@ void udp_relay_cb(struct event_data *event)
         {
             return;
         }
-        fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+        LOG_DEBUG("%s\n", strerror(errno));
     }
 
     // check the validity of the packet
@@ -447,11 +572,11 @@ void udp_relay_cb(struct event_data *event)
                 dst_addr = resolve_domain(domain, &atyp);
                 if (dst_addr == 0U)
                 {
-                    printf("resolve error: %s\n", domain);
+                    LOG_DEBUG("resolve error: %s\n", domain);
                 }
                 else
                 {
-                    printf("resolve success: %s\n", domain);
+                    LOG_DEBUG("resolve success: %s\n", domain);
                 }
                 memcpy(&dst_port, udp_request->dst.domain.str + udp_request->dst.domain.len, 2);
                 free(domain);
@@ -501,7 +626,7 @@ void udp_relay_cb(struct event_data *event)
     }
 }
 
-void auth_cb(struct event_data *client_event)
+static void auth_cb(struct event_data *client_event)
 {
     int recvlen, sendlen;
     uint8_t rx[MAX_AUTH_REQUEST_LEN] = {0}, tx[AUTH_REPLY_LEN] = {0};
@@ -511,7 +636,7 @@ void auth_cb(struct event_data *client_event)
     recvlen = recv(client_event->fd, rx, MAX_AUTH_REQUEST_LEN, 0);
     if (recvlen == -1)
     {
-        perror("auth_cb_recv");
+        LOG_DEBUG("auth_cb recv error\n");
         if (errno == EAGAIN)
         {
             return;
@@ -531,12 +656,13 @@ void auth_cb(struct event_data *client_event)
     auth_reply->ver = AUTH_VERSION;
     if (!strcmp(uname, "dev") && !strcmp(passwd, "123456"))
     {
-        printf("auth_success\n");
+        LOG_DEBUG("auth_success\n");
         auth_reply->status = AUTH_SUCCESS;
         sendlen = send(client_event->fd, tx, AUTH_REPLY_LEN, 0);
         if (sendlen == -1)
         {
-            fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+            LOG_DEBUG("%s\n", strerror(errno));
+            LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
             clear_event(client_event);
             free(uname);
             free(passwd);
@@ -546,20 +672,21 @@ void auth_cb(struct event_data *client_event)
     }
     else
     {
-        printf("auth_failure\n");
+        LOG_DEBUG("auth_failure\n");
         auth_reply->status = AUTH_FAILURE;
         sendlen = send(client_event->fd, tx, AUTH_REPLY_LEN, 0);
         if (sendlen == -1)
         {
-            fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+            LOG_DEBUG("%s\n", strerror(errno));
         }
+        LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
         clear_event(client_event);
     }
     free(uname);
     free(passwd);
 }
 
-void accept_cb(struct event_data *server_event)
+static void accept_cb(struct event_data *server_event)
 {
     struct sockaddr_in client_addr;
     memset(&client_addr, 0, sizeof(client_addr));
@@ -567,13 +694,13 @@ void accept_cb(struct event_data *server_event)
     int client_fd = accept(server_event->fd, (struct sockaddr *)&client_addr, &client_addr_len);
     if (client_fd == -1)
     {
-        fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
+        LOG_DEBUG("%s\n", strerror(errno));
     }
     else
     {
-        fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
+        // fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
 
-        struct event_data *client_event = (struct event_data *)malloc(sizeof(struct event_data));
+        struct event_data *client_event = (struct event_data *)calloc(1, sizeof(struct event_data));
         client_event->addr = client_addr;
         client_event->fd = client_fd;
         client_event->cb = method_reply_cb;
@@ -582,8 +709,14 @@ void accept_cb(struct event_data *server_event)
     }
 }
 
-void worker()
+static void worker()
 {
+    if (ares_init(&channel) != ARES_SUCCESS)
+    {
+        printf("ares feiled \n");
+        return;
+    }
+
     server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -597,16 +730,16 @@ void worker()
     int reuse = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-    fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
+    // fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
 
     bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
     listen(server_fd, 5);
-    printf("listening port 1080\n");
+    LOG_INFO("listening port %d\n", LISTEN_PORT);
 
     epoll_fd = epoll_create(1024);
 
     // server_event
-    struct event_data *server_event = (struct event_data *)malloc(sizeof(struct event_data));
+    struct event_data *server_event = (struct event_data *)calloc(1, sizeof(struct event_data));
     server_event->addr = server_addr;
     server_event->fd = server_fd;
     server_event->cb = accept_cb;
@@ -619,25 +752,30 @@ void worker()
     close(epoll_fd);
 }
 
-int main()
+int main(int argc, char *argv[])
 {
-    for (int i = 0; i < MAX_WORKERS; i++)
-    {
-        pid_t pid = fork();
-        if (pid == 0)
-        {
-            worker();
-        }
-        if (pid < 0)
-        {
-            fprintf(stderr, "%s(%d) %s\n", __FILE__, __LINE__, strerror(errno));
-        }
-    }
 
-    while (wait(NULL) != 0)
-    {
-        break;
-    }
+    log_info();
+
+    worker();
+
+    // for (int i = 0; i < MAX_WORKERS; i++)
+    // {
+    //     pid_t pid = fork();
+    //     if (pid == 0)
+    //     {
+    //         worker();
+    //     }
+    //     if (pid < 0)
+    //     {
+    //         LOG_INFO("%s\n", strerror(errno));
+    //     }
+    // }
+    //
+    // while (wait(NULL) != 0)
+    // {
+    //     break;
+    // }
 
     return 0;
 }
