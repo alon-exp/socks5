@@ -9,7 +9,7 @@ char *add_socks_udp_header(struct socks_udp_header *socks_udp_header, uint8_t *p
     socks_udp_header->dst.ipv4.addr = remote_udp_addr;
     socks_udp_header->dst.ipv4.port = remote_udp_port;
 
-    memcpy(socks_udp_header + 10, payload, strlen(payload));
+    memcpy(socks_udp_header + 10, payload, strlen((char *)payload));
     return (char *)socks_udp_header;
 }
 
@@ -54,21 +54,21 @@ bool check_validity(uint8_t *rx, int recvlen, int stage)
             return false;
         if (socks_request->atyp == IPV4)
         {
-            if (recvlen - 4 != 6)
+            if (recvlen != 10)
             {
                 return false;
             }
         }
         else if (socks_request->atyp == IPV6)
         {
-            if (recvlen - 4 != 18)
+            if (recvlen != 22)
             {
                 return false;
             }
         }
         else if (socks_request->atyp == DOMAIN)
         {
-            if (recvlen - 5 != 2 + socks_request->dst.domain.len)
+            if (recvlen != 7 + socks_request->dst.domain.len)
             {
                 return false;
             }
@@ -82,14 +82,12 @@ bool check_validity(uint8_t *rx, int recvlen, int stage)
     return false;
 }
 
-bool check_method(uint8_t *rx, uint8_t method)
+bool check_method(uint8_t *rx, int recvlen, uint8_t method)
 {
     struct method_request *method_request = (struct method_request *)rx;
-    uint8_t *methods = (uint8_t *)malloc(method_request->nmethods);
-    memcpy(methods, method_request->methods, method_request->nmethods);
-    for (int i = 0; i < method_request->nmethods; i++)
+    for (size_t i = 0; i < method_request->nmethods && i < recvlen - 2; i++)
     {
-        if (methods[i] == method)
+        if (method_request->methods[i] == method)
         {
             return true;
         }
