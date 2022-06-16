@@ -21,6 +21,7 @@ struct event_data
 {
     int fd;
     int type;
+    int closed;
     struct sockaddr_in addr;
     void (*cb)(struct event_data *event_data);
     struct event_data *to;
