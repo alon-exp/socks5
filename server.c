@@ -27,7 +27,6 @@
 extern int epoll_fd;
 int server_fd;
 ares_channel channel;
-ares_socket_t dns_query_sock = -1;
 struct dns_cache *dns_cache_head = NULL;
 
 static void method_reply_cb(struct event_data *client_event)
@@ -41,10 +40,7 @@ static void method_reply_cb(struct event_data *client_event)
     if (recvlen == -1)
     {
         LOG_DEBUG("method_reply_cb recv error: %s\n", strerror(errno));
-        if (errno == EAGAIN)
-        {
-            return;
-        }
+        return;
     }
 
     // check the validity of the packet
@@ -58,8 +54,6 @@ static void method_reply_cb(struct event_data *client_event)
             if (sendlen == -1)
             {
                 LOG_DEBUG("%s\n", strerror(errno));
-                // LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
-                // clear_event(client_event);
                 return;
             }
             // move to the next step
@@ -72,8 +66,6 @@ static void method_reply_cb(struct event_data *client_event)
             if (sendlen == -1)
             {
                 LOG_DEBUG("%s\n", strerror(errno));
-                // LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
-                // clear_event(client_event);
                 return;
             }
             // move to the next step
@@ -98,7 +90,7 @@ static void method_reply_cb(struct event_data *client_event)
     }
 }
 
-void resolve_domain_cb(void *arg, int status, int timeouts, struct hostent *host)
+static void ares_host_cb(void *arg, int status, int timeouts, struct hostent *host)
 {
     struct
     {
@@ -115,7 +107,7 @@ void resolve_domain_cb(void *arg, int status, int timeouts, struct hostent *host
     struct dns_cache *dns_cache_ret = NULL;
     HASH_FIND_STR(dns_cache_head, domain, dns_cache_ret);
 
-    LOG_DEBUG("resolve_domain_cb status: %s\n", ares_strerror(status));
+    LOG_DEBUG("ares_host_cb status: %s\n", ares_strerror(status));
     LOG_DEBUG("remote: %s fd: %d\n", domain, conn_relay_argv->client_event->fd);
     free(domain);
 
@@ -128,9 +120,12 @@ void resolve_domain_cb(void *arg, int status, int timeouts, struct hostent *host
         conn_relay(conn_relay_argv->client_event, conn_relay_argv->socks_request, *(in_addr_t *)host->h_addr);
     }
 
-    // LOG_DEBUG("clear dns query event fd: %d\n", conn_relay_argv->dns_query->fd);
-    // clear_event(conn_relay_argv->dns_query);
     free(arg);
+}
+
+static void dns_query_cb(struct event_data *dns_query_event)
+{
+    ares_process_fd(channel, dns_query_event->fd, dns_query_event->fd);
 }
 
 static void conn_relay(struct event_data *client_event, struct socks_request *socks_request, in_addr_t conn_addr)
@@ -156,22 +151,13 @@ static void conn_relay(struct event_data *client_event, struct socks_request *so
             memcpy(domain, socks_request->dst.domain.str, socks_request->dst.domain.len);
 
             if (conn_addr)
-            {
                 dst_addr = conn_addr;
-            }
-            else
-            {
-                dst_addr = resolve_domain(domain, &atyp);
-            }
 
-            if (dst_addr == 0U)
-            {
-                LOG_DEBUG("resolve error: %s\n", domain);
-            }
+            if (dst_addr == 0)
+                LOG_DEBUG("resolve failed: %s\n", domain);
             else
-            {
                 LOG_DEBUG("resolve success: %s\n", domain);
-            }
+
             dst_port = *(uint16_t *)(socks_request->dst.domain.str + socks_request->dst.domain.len);
             free(domain);
         }
@@ -235,7 +221,6 @@ static void conn_relay(struct event_data *client_event, struct socks_request *so
             clear_event(client_event);
             close(remote_fd);
             free(remote_event);
-            // clear_event(remote_event);
         }
         else
         {
@@ -245,8 +230,6 @@ static void conn_relay(struct event_data *client_event, struct socks_request *so
             if (sendlen == -1)
             {
                 LOG_DEBUG("%s\n", strerror(errno));
-                // LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
-                // clear_event(client_event);
                 close(remote_fd);
                 free(remote_event);
                 return;
@@ -293,9 +276,7 @@ static void udp_relay(struct event_data *client_event, struct socks_request *soc
         if (socks_request->atyp == DOMAIN)
         {
             int atyp;
-            char *domain = (char *)malloc(socks_request->dst.domain.len + 1);
-            // memset(domain, '\0', socks_request->dst.domain.len + 1);
-            domain[socks_request->dst.domain.len] = '\0';
+            char *domain = (char *)calloc(1, socks_request->dst.domain.len + 1);
             memcpy(domain, socks_request->dst.domain.str, socks_request->dst.domain.len);
             src_addr = resolve_domain(domain, &atyp);
             if (src_addr == 0U)
@@ -399,7 +380,6 @@ static void not_support(struct event_data *client_event, struct socks_request *s
 static void socks_reply_cb(struct event_data *client_event)
 {
     int recvlen, sendlen;
-    // uint8_t rx[MAX_SOCKS_REQUEST_LEN] = {0};
     uint8_t *rx = (uint8_t *)malloc(MAX_SOCKS_REQUEST_LEN);
     struct socks_request *socks_request = (struct socks_request *)rx;
 
@@ -424,9 +404,8 @@ static void socks_reply_cb(struct event_data *client_event)
     switch (socks_request->cmd)
     {
     case CONNECT:
-        if (socks_request->atyp == DOMAIN && true)
+        if (socks_request->atyp == DOMAIN)
         {
-
             struct event_data *dns_query_event = (struct event_data *)calloc(1, sizeof(struct event_data));
 
             typedef struct
@@ -466,12 +445,11 @@ static void socks_reply_cb(struct event_data *client_event)
             else
             {
                 HASH_ADD_KEYPTR(hh, dns_cache_head, domain, socks_request->dst.domain.len, dns_cache);
-                ares_gethostbyname(channel, domain, AF_INET, resolve_domain_cb, conn_relay_arg);
+                ares_gethostbyname(channel, domain, AF_INET, ares_host_cb, conn_relay_arg);
                 LOG_DEBUG("domain len: %d resolve domain name: %s\n", socks_request->dst.domain.len, domain);
             }
 
-            // free(domain);
-            // ares_socket_t sock;
+            ares_socket_t dns_query_sock = ARES_SOCKET_BAD;
             int bitmask = ares_getsock(channel, &dns_query_sock, 1);
             LOG_DEBUG("ares_getsock: %d\n", dns_query_sock);
 
@@ -485,13 +463,14 @@ static void socks_reply_cb(struct event_data *client_event)
                 events |= EPOLLOUT;
             }
 
+            dns_query_event->cb = dns_query_cb;
             dns_query_event->fd = dns_query_sock;
             dns_query_event->type = EVENT_DATA_TYPE_DNS;
             opt_event(epoll_fd, EPOLL_CTL_ADD, dns_query_event, events);
         }
         else
         {
-            conn_relay(client_event, socks_request, 0U);
+            conn_relay(client_event, socks_request, 0);
         }
         break;
     case BIND:
@@ -534,18 +513,15 @@ static void udp_relay_cb(struct event_data *event)
     int recvlen, sendlen;
     uint8_t rx[BUF_SIZE] = {0}, tx[BUF_SIZE] = {0};
     struct socks_udp_header *udp_request = (struct socks_udp_header *)rx;
-    struct socks_udp_header *udp_reply = (struct socks_udp_header *)tx;
+    struct socks_udp_header *udp_response = (struct socks_udp_header *)tx;
     struct sockaddr_in sender_udp_addr;
 
     socklen_t sender_udp_addr_len = sizeof(struct sockaddr_in);
     recvlen = recvfrom(event->fd, rx, BUF_SIZE, 0, (struct sockaddr *)&sender_udp_addr, &sender_udp_addr_len);
     if (recvlen == -1)
     {
-        if (errno == EAGAIN)
-        {
-            return;
-        }
         LOG_DEBUG("%s\n", strerror(errno));
+        return;
     }
 
     // check the validity of the packet
@@ -554,10 +530,6 @@ static void udp_relay_cb(struct event_data *event)
     {
         if (udp_request->atyp == IPV4 || udp_request->atyp == DOMAIN)
         {
-
-            int remote_udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            struct event_data *remote_udp_event = (struct event_data *)malloc(sizeof(struct event_data));
-            struct event_data *client_udp_event = event;
             struct sockaddr_in remote_udp_addr;
 
             in_addr_t dst_addr;
@@ -565,9 +537,7 @@ static void udp_relay_cb(struct event_data *event)
             if (udp_request->atyp == DOMAIN)
             {
                 int atyp;
-                char *domain = (char *)malloc(udp_request->dst.domain.len + 1);
-                // memset(domain, '\0', socks_request->dst.domain.len + 1);
-                domain[udp_request->dst.domain.len] = '\0';
+                char *domain = (char *)calloc(1, udp_request->dst.domain.len + 1);
                 memcpy(domain, udp_request->dst.domain.str, udp_request->dst.domain.len);
                 dst_addr = resolve_domain(domain, &atyp);
                 if (dst_addr == 0U)
@@ -593,32 +563,20 @@ static void udp_relay_cb(struct event_data *event)
 
             int del_len;
             char *payload = del_socks_udp_header(udp_request, NULL, &del_len);
-            sendlen = sendto(remote_udp_fd, payload, recvlen - del_len, 0, (struct sockaddr *)&remote_udp_addr, sizeof(remote_udp_addr));
+            sendlen = sendto(event->fd, payload, recvlen - del_len, 0, (struct sockaddr *)&remote_udp_addr, sizeof(remote_udp_addr));
             if (sendlen == -1)
             {
-                close(remote_udp_fd);
-                free(remote_udp_event);
                 return;
             }
-
-            memset(&remote_udp_event->addr, 0, sizeof(struct sockaddr));
-            remote_udp_event->fd = remote_udp_fd;
-            remote_udp_event->cb = udp_relay_cb;
-            remote_udp_event->to = client_udp_event;
-
-            client_udp_event->to = remote_udp_event;
-            client_udp_event->cb = udp_relay_cb;
-            opt_event(epoll_fd, EPOLL_CTL_ADD, remote_udp_event, EPOLLIN);
         }
     }
     else
     {
         int add_len;
-        in_addr_t remote_udp_addr;
-        in_port_t remote_udp_port;
-        get_peer_sockaddr(event->fd, &remote_udp_addr, &remote_udp_port);
-        add_socks_udp_header(udp_reply, rx, remote_udp_addr, remote_udp_port, &add_len);
-        sendlen = sendto(event->to->fd, udp_relay, recvlen + add_len, 0, (struct sockaddr *)&event->to->addr, sizeof(struct sockaddr));
+        in_addr_t remote_udp_addr = sender_udp_addr.sin_addr.s_addr;
+        in_port_t remote_udp_port = sender_udp_addr.sin_port;
+        add_socks_udp_header(udp_response, rx, remote_udp_addr, remote_udp_port, &add_len);
+        sendlen = sendto(event->to->fd, udp_response, recvlen + add_len, 0, (struct sockaddr *)&event->to->addr, sizeof(struct sockaddr));
         if (sendlen == -1)
         {
             return;
@@ -646,15 +604,12 @@ static void auth_cb(struct event_data *client_event)
     // after recv
     struct auth_request_uname *auth_request_uname = (struct auth_request_uname *)rx + 1;
     struct auth_request_passwd *auth_request_passwd = (struct auth_request_passwd *)rx + 2 + auth_request_uname->ulen;
-    char *uname = (char *)malloc(auth_request_uname->ulen + 1);
-    char *passwd = (char *)malloc(auth_request_passwd->plen + 1);
-    memcpy(uname, auth_request_uname->uname, auth_request_uname->ulen);
-    memcpy(passwd, auth_request_passwd->passwd, auth_request_passwd->plen);
-    uname[auth_request_uname->ulen] = '\0';
-    passwd[auth_request_passwd->plen] = '\0';
 
     auth_reply->ver = AUTH_VERSION;
-    if (!strcmp(uname, "dev") && !strcmp(passwd, "123456"))
+    if (auth_request_uname->ulen == 3 &&
+        auth_request_passwd->plen == 6 &&
+        !memcmp(auth_request_uname->uname, "dev", 3) &&
+        !memcmp(auth_request_passwd->passwd, "123456", 6))
     {
         LOG_DEBUG("auth_success\n");
         auth_reply->status = AUTH_SUCCESS;
@@ -662,10 +617,6 @@ static void auth_cb(struct event_data *client_event)
         if (sendlen == -1)
         {
             LOG_DEBUG("%s\n", strerror(errno));
-            LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
-            clear_event(client_event);
-            free(uname);
-            free(passwd);
             return;
         }
         client_event->cb = socks_reply_cb;
@@ -682,8 +633,6 @@ static void auth_cb(struct event_data *client_event)
         LOG_DEBUG("%s call clear_event\n", __FUNCTION__);
         clear_event(client_event);
     }
-    free(uname);
-    free(passwd);
 }
 
 static void accept_cb(struct event_data *server_event)
@@ -730,7 +679,7 @@ static void worker()
     int reuse = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-    // fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
+    fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
 
     bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
     listen(server_fd, 5);
@@ -758,24 +707,6 @@ int main(int argc, char *argv[])
     log_info();
 
     worker();
-
-    // for (int i = 0; i < MAX_WORKERS; i++)
-    // {
-    //     pid_t pid = fork();
-    //     if (pid == 0)
-    //     {
-    //         worker();
-    //     }
-    //     if (pid < 0)
-    //     {
-    //         LOG_INFO("%s\n", strerror(errno));
-    //     }
-    // }
-    //
-    // while (wait(NULL) != 0)
-    // {
-    //     break;
-    // }
 
     return 0;
 }
