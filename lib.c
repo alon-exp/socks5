@@ -2,7 +2,6 @@
 #include "log.h"
 
 extern int server_fd;
-extern ares_channel channel;
 int epoll_fd;
 
 void opt_event(int epoll_fd, int opt, struct event_data *event_data, uint32_t state)
@@ -53,16 +52,10 @@ void epoll_start(int epoll_fd, int epoll_max_events, int timeout)
                 LOG_DEBUG("event_data epollhup close fd %d\n", event_data->fd);
                 clear_event(event_data);
             }
-            else if (events[i].events & EPOLLIN && event_data->type != EVENT_DATA_TYPE_DNS)
+            else if (events[i].events & EPOLLIN)
             {
                 // callback function
                 event_data->cb(event_data);
-            }
-            else if (event_data->type == EVENT_DATA_TYPE_DNS)
-            {
-                ares_process_fd(channel,
-                                ((events[i].events) & (EPOLLIN) ? event_data->fd : ARES_SOCKET_BAD),
-                                ((events[i].events) & (EPOLLOUT) ? event_data->fd : ARES_SOCKET_BAD));
             }
         }
     }
