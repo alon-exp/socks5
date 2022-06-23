@@ -39,8 +39,9 @@ struct dns_cache
 
 typedef void (*cb_t)(struct event_data *event_data);
 
-void opt_event(int epollfd, int opt, struct event_data *event_data, uint32_t state);
+int epoll_init(int nfds);
+void add_event(struct event_data *event, uint32_t state);
 void clear_event(struct event_data *event);
-void epoll_start(int epollfd, int epoll_max_events, int timeout);
+void epoll_start(int listenfd, int epoll_max_events, int timeout);
 
 #endif

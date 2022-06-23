@@ -24,8 +24,6 @@
 #define LISTEN_PORT 1080
 #define MAX_WORKERS 4
 
-extern int epoll_fd;
-int server_fd;
 ares_channel channel;
 struct dns_cache *dns_cache_head = NULL;
 
@@ -96,7 +94,7 @@ static void ares_host_cb(void *arg, int status, int timeouts, struct hostent *ho
     {
         struct event_data *client_event;
         struct socks_request *socks_request;
-        struct event_data *dns_query;
+        struct event_data *dns_query_event;
     } *conn_relay_argv = arg;
 
     char *domain = (char *)calloc(1, conn_relay_argv->socks_request->dst.domain.len + 1);
@@ -244,7 +242,7 @@ static void conn_relay(struct event_data *client_event, struct socks_request *so
             // client_event
             client_event->to = remote_event;
             client_event->cb = tcp_relay_cb;
-            opt_event(epoll_fd, EPOLL_CTL_ADD, remote_event, EPOLLIN);
+            add_event(remote_event, EPOLLIN);
         }
     }
     else
@@ -278,15 +276,13 @@ static void udp_relay(struct event_data *client_event, struct socks_request *soc
             int atyp;
             char *domain = (char *)calloc(1, socks_request->dst.domain.len + 1);
             memcpy(domain, socks_request->dst.domain.str, socks_request->dst.domain.len);
+            
             src_addr = resolve_domain(domain, &atyp);
-            if (src_addr == 0U)
-            {
+            if (src_addr == 0)
                 LOG_DEBUG("resolve error: %s\n", domain);
-            }
             else
-            {
                 LOG_DEBUG("resolve success: %s\n", domain);
-            }
+
             memcpy(&src_port, socks_request->dst.domain.str + socks_request->dst.domain.len, 2);
             free(domain);
         }
@@ -347,7 +343,7 @@ static void udp_relay(struct event_data *client_event, struct socks_request *soc
             client_udp_event->fd = udp_fd;
             client_udp_event->cb = udp_relay_cb;
             client_udp_event->to = NULL;
-            opt_event(epoll_fd, EPOLL_CTL_ADD, client_udp_event, EPOLLIN);
+            add_event(client_udp_event, EPOLLIN);
         }
     }
     else
@@ -387,10 +383,7 @@ static void socks_reply_cb(struct event_data *client_event)
     if (recvlen == -1)
     {
         LOG_DEBUG("socks_relay_cb recv error: %s\n", strerror(errno));
-        if (errno == EAGAIN)
-        {
-            return;
-        }
+        return;
     }
 
     // check the validity of the packet
@@ -466,7 +459,7 @@ static void socks_reply_cb(struct event_data *client_event)
             dns_query_event->cb = dns_query_cb;
             dns_query_event->fd = dns_query_sock;
             dns_query_event->type = EVENT_DATA_TYPE_DNS;
-            opt_event(epoll_fd, EPOLL_CTL_ADD, dns_query_event, events);
+            add_event(dns_query_event, events);
         }
         else
         {
@@ -540,7 +533,7 @@ static void udp_relay_cb(struct event_data *event)
                 char *domain = (char *)calloc(1, udp_request->dst.domain.len + 1);
                 memcpy(domain, udp_request->dst.domain.str, udp_request->dst.domain.len);
                 dst_addr = resolve_domain(domain, &atyp);
-                if (dst_addr == 0U)
+                if (dst_addr == 0)
                 {
                     LOG_DEBUG("resolve error: %s\n", domain);
                 }
@@ -595,10 +588,7 @@ static void auth_cb(struct event_data *client_event)
     if (recvlen == -1)
     {
         LOG_DEBUG("auth_cb recv error\n");
-        if (errno == EAGAIN)
-        {
-            return;
-        }
+        return;
     }
 
     // after recv
@@ -654,7 +644,7 @@ static void accept_cb(struct event_data *server_event)
         client_event->fd = client_fd;
         client_event->cb = method_reply_cb;
         client_event->to = NULL;
-        opt_event(epoll_fd, EPOLL_CTL_ADD, client_event, EPOLLIN);
+        add_event(client_event, EPOLLIN);
     }
 }
 
@@ -662,11 +652,11 @@ static void worker()
 {
     if (ares_init(&channel) != ARES_SUCCESS)
     {
-        printf("ares feiled \n");
+        LOG_DEBUG("ares_init failed\n");
         return;
     }
 
-    server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
 
@@ -685,7 +675,7 @@ static void worker()
     listen(server_fd, 5);
     LOG_INFO("listening port %d\n", LISTEN_PORT);
 
-    epoll_fd = epoll_create(1024);
+    int epoll_fd = epoll_init(1024);
 
     // server_event
     struct event_data *server_event = (struct event_data *)calloc(1, sizeof(struct event_data));
@@ -694,9 +684,9 @@ static void worker()
     server_event->cb = accept_cb;
     server_event->to = NULL;
 
-    opt_event(epoll_fd, EPOLL_CTL_ADD, server_event, EPOLLIN);
+    add_event(server_event, EPOLLIN);
 
-    epoll_start(epoll_fd, EPOLL_MAX_EVENTS, -1);
+    epoll_start(server_fd, EPOLL_MAX_EVENTS, -1);
     close(server_fd);
     close(epoll_fd);
 }

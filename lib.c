@@ -1,23 +1,31 @@
 #include "lib.h"
 #include "log.h"
 
-extern int server_fd;
-int epoll_fd;
+static int epoll_fd;
 
-void opt_event(int epoll_fd, int opt, struct event_data *event_data, uint32_t state)
+int epoll_init(int nfds)
+{
+    return epoll_fd = epoll_create(nfds);
+}
+
+void add_event(struct event_data *event, uint32_t state)
 {
     struct epoll_event ev;
     ev.events = state;
-    ev.data.ptr = event_data;
-    if (epoll_ctl(epoll_fd, opt, event_data->fd, &ev) == -1)
+    ev.data.ptr = event;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event->fd, &ev) == -1)
     {
-        LOG_DEBUG("opt_event: %s\n", strerror(errno));
+        LOG_DEBUG("epoll_ctl: %s\n", strerror(errno));
     }
 }
 
 void clear_event(struct event_data *event)
 {
-    opt_event(epoll_fd, EPOLL_CTL_DEL, event, EPOLLIN);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event->fd, NULL) == -1)
+    {
+        LOG_DEBUG("epoll_ctl: %s\n", strerror(errno));
+    }
+
     if (errno == EBADF || errno == ENOENT)
     {
         return;
@@ -33,7 +41,7 @@ void clear_event(struct event_data *event)
     free(event);
 }
 
-void epoll_start(int epoll_fd, int epoll_max_events, int timeout)
+void epoll_start(int listenfd, int epoll_max_events, int timeout)
 {
     struct epoll_event events[epoll_max_events];
     struct event_data *event_data;
@@ -46,7 +54,7 @@ void epoll_start(int epoll_fd, int epoll_max_events, int timeout)
         {
             event_data = (struct event_data *)events[i].data.ptr;
 
-            if ((events[i].events & EPOLLHUP || events[i].events & EPOLLERR) && event_data->fd != server_fd)
+            if ((events[i].events & EPOLLHUP || events[i].events & EPOLLERR) /* && event_data->fd != listenfd */)
             {
                 // handle close / rst bit
                 LOG_DEBUG("event_data epollhup close fd %d\n", event_data->fd);
