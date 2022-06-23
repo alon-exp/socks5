@@ -4,7 +4,7 @@ char *add_socks_udp_header(struct socks_udp_header *socks_udp_header, uint8_t *p
 {
     // ipv4 only
     socks_udp_header->rsv = UDP_RESERVED;
-    socks_udp_header->frag = UDP_FRAG;
+    socks_udp_header->frag = UDP_FRAG_STANDALONE;
     socks_udp_header->atyp = IPV4;
     socks_udp_header->dst.ipv4.addr = remote_udp_addr;
     socks_udp_header->dst.ipv4.port = remote_udp_port;
